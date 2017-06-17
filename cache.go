@@ -1,207 +1,179 @@
 package expirecache
 
 import (
+	"context"
 	"math/rand"
 	"sync"
 	"time"
 )
 
-type element struct {
-	validUntil time.Time
-	data       interface{}
-	size       uint64
+func expired(e element, u int64) bool {
+	if e.evicted {
+		return true
+	}
+	if e.maxAge < u {
+		return true
+	}
+	return false
 }
 
-// Cache is an expiring cache.  It is safe for
-type Cache struct {
+// Element is an element stored in the cache.
+// maxAge and arrival are unix timestamps.
+type element struct {
+	arrival int64
+	maxAge  int64
+	data    interface{}
+	size    uint64
+	evicted bool
+}
+
+// ExpireCache is an expiring cache.
+// Evicted data is returned on the evictions channel.
+type ExpireCache struct {
 	sync.RWMutex
 	cache     map[string]element
-	keys      []string
+	ctx       context.Context
+	cancel    context.CancelFunc
+	elements  []string
 	totalSize uint64
 	maxSize   uint64
+	evictions chan interface{}
 }
 
-// New creates a new cache with a maximum memory size
-func New(maxSize uint64) *Cache {
-	return &Cache{
-		cache:   make(map[string]element),
-		maxSize: maxSize,
+// NewExpireCache creates a new expire cache with maximum size, maxSize.
+// A channel containing evicted elements is returned along with a pointer to the cache.
+func NewExpireCache(ctx context.Context, maxSize uint64) (*ExpireCache, chan interface{}) {
+	cacheContext, cancelExpireCache := context.WithCancel(ctx)
+	ev := make(chan interface{})
+	c := &ExpireCache{
+		ctx:       cacheContext,
+		cancel:    cancelExpireCache,
+		cache:     make(map[string]element),
+		maxSize:   maxSize,
+		evictions: ev,
 	}
+
+	const cleanerDelay = time.Duration(time.Second * 15)
+	go func() {
+		for {
+			c.clean(time.Now())
+			select {
+			case <-c.ctx.Done():
+				c.clean(time.Time{})
+				close(c.evictions)
+				return
+			case <-time.After(cleanerDelay):
+				continue
+			}
+		}
+	}()
+
+	return c, c.evictions
 }
 
-// Size returns the current memory size of the cache
-func (ec *Cache) Size() uint64 {
+// Size returns the current memory size of the cache.
+func (ec *ExpireCache) Size() uint64 {
 	ec.RLock()
 	s := ec.totalSize
 	ec.RUnlock()
 	return s
 }
 
-// Items returns the number of items in the cache
-func (ec *Cache) Items() int {
-	ec.RLock()
-	k := len(ec.keys)
-	ec.RUnlock()
-	return k
-}
-
-// Get returns the item from the cache
-func (ec *Cache) Get(k string) (item interface{}, ok bool) {
+// Get returns the element from the cache.
+func (ec *ExpireCache) Get(k string) (element interface{}, ok bool) {
 	ec.RLock()
 	v, ok := ec.cache[k]
 	ec.RUnlock()
-	if !ok || v.validUntil.Before(timeNow()) {
-		// Can't actually delete this element from the cache here since
-		// we can't remove the key from ec.keys without a linear search.
-		// It'll get removed during the next cleanup
+
+	if !ok || expired(v, time.Now().Unix()) {
+		// NOTE: deletion now would require a linear search.
 		return nil, false
 	}
+
 	return v.data, ok
 }
 
-// GetOrSet returns the item from the cache or sets a new variable if it doesn't exist
-func (ec *Cache) GetOrSet(k string, newValue interface{}, size uint64, expire int32) (item interface{}) {
+// Set adds an element to the cache, with an estimated size and a maximum lifetime specified as a time.Duration.
+func (ec *ExpireCache) Set(k string, v interface{}, size uint64, lifetime time.Duration) {
 	ec.Lock()
-	v, ok := ec.cache[k]
-	if !ok || v.validUntil.Before(timeNow()) {
-		ec.actualSet(k, newValue, size, expire)
-		ec.Unlock()
-		return newValue
-	}
-	ec.Unlock()
-	return v.data
-}
-
-// Set adds an item to the cache, with an estimated size and expiration time in seconds.
-func (ec *Cache) Set(k string, v interface{}, size uint64, expire int32) {
-	ec.Lock()
-	ec.actualSet(k, v, size, expire)
-	ec.Unlock()
-}
-
-func (ec *Cache) actualSet(k string, v interface{}, size uint64, expire int32) {
 	oldv, ok := ec.cache[k]
 	if !ok {
-		ec.keys = append(ec.keys, k)
+		ec.elements = append(ec.elements, k)
 	} else {
 		ec.totalSize -= oldv.size
 	}
-
 	ec.totalSize += size
-	ec.cache[k] = element{validUntil: timeNow().Add(time.Duration(expire) * time.Second), data: v, size: size}
+	ec.cache[k] = element{maxAge: time.Now().Add(lifetime).Unix(), data: v, size: size, arrival: time.Now().Unix()}
 
+	// evict elements from the cache if the cache has grown too large.
 	for ec.maxSize > 0 && ec.totalSize > ec.maxSize {
 		ec.randomEvict()
 	}
+	ec.Unlock()
 }
 
-func (ec *Cache) randomEvict() {
-	slot := rand.Intn(len(ec.keys))
-	k := ec.keys[slot]
+// Evict evicts the element at k by setting the elements evictions field to true
+// and pushing the element's data on to the evictions channel.
+func (ec *ExpireCache) Evict(k string) (ok bool) {
+	ec.RLock()
+	v, ok := ec.cache[k]
+	ec.RUnlock()
+	if ok {
+		ec.Lock()
+		ec.evictions <- ec.cache[k].data
+		v.evicted = true
+		// NOTE: we cannot delete here, doing so would require a linear search.
+		ec.Unlock()
+		return true
+	}
+	return false
+}
 
-	ec.keys[slot] = ec.keys[len(ec.keys)-1]
-	ec.keys = ec.keys[:len(ec.keys)-1]
-
+// randomEvict evicts a random element.
+func (ec *ExpireCache) randomEvict() {
+	slot := rand.Intn(len(ec.elements))
+	k := ec.elements[slot]
+	ec.elements[slot] = ec.elements[len(ec.elements)-1]
+	ec.elements = ec.elements[:len(ec.elements)-1]
 	v := ec.cache[k]
 	ec.totalSize -= v.size
-
+	if !v.evicted {
+		ec.evictions <- ec.cache[k].data
+	}
 	delete(ec.cache, k)
 }
 
-// Cleaner starts a goroutine which wakes up periodically and removes all expired items from the cache.
-func (ec *Cache) Cleaner(d time.Duration) {
-
-	for {
-		cleanerSleep(d)
-
-		now := timeNow()
-		ec.Lock()
-
-		// We could potentially be holding this lock for a long time,
-		// but since we keep the cache expiration times small, we
-		// expect only a small number of elements here to loop over
-
-		for i := 0; i < len(ec.keys); i++ {
-			k := ec.keys[i]
-			v := ec.cache[k]
-			if v.validUntil.Before(now) {
-				ec.totalSize -= v.size
-				delete(ec.cache, k)
-
-				ec.keys[i] = ec.keys[len(ec.keys)-1]
-				ec.keys = ec.keys[:len(ec.keys)-1]
-				i-- // so we reprocess this index
-			}
-		}
-
-		ec.Unlock()
-		cleanerDone()
-	}
-}
-
-func (ec *Cache) StoppableApproximateCleaner(d time.Duration, exit <-chan struct{}) {
-	for {
-		select {
-		case <-exit:
-			return
-		default:
-		}
-
-		cleanerSleep(d)
-
-		ec.clean(timeNow())
-
-		cleanerDone()
-	}
-
-}
-
-// ApproximateCleaner starts a goroutine which wakes up periodically and removes a sample of expired items from the cache.
-func (ec *Cache) ApproximateCleaner(d time.Duration) {
-	for {
-		cleanerSleep(d)
-
-		ec.clean(timeNow())
-
-		cleanerDone()
-	}
-}
-
-func (ec *Cache) clean(now time.Time) {
-	// every iteration, sample and clean this many items
+// clean runs the approximate cleaner.
+func (ec *ExpireCache) clean(now time.Time) {
 	const sampleSize = 20
-	// if we cleaned at least this many, run the loop again
 	const rerunCount = 5
-
 
 	for {
 		var cleaned int
-		// by doing short iterations and releasing the lock in between, we don't block other requests from progressing.
 		ec.Lock()
-		for i := 0; len(ec.keys) > 0 && i < sampleSize; i++ {
-			idx := rand.Intn(len(ec.keys))
-			k := ec.keys[idx]
+		for i := 0; len(ec.elements) > 0 && i < sampleSize; i++ {
+			idx := rand.Intn(len(ec.elements))
+			k := ec.elements[idx]
 			v := ec.cache[k]
-			if v.validUntil.Before(now) {
+			if v.maxAge < time.Now().Unix() {
 				ec.totalSize -= v.size
+				if !v.evicted {
+					ec.evictions <- ec.cache[k].data
+				}
 				delete(ec.cache, k)
-
-				ec.keys[idx] = ec.keys[len(ec.keys)-1]
-				ec.keys = ec.keys[:len(ec.keys)-1]
+				ec.elements[idx] = ec.elements[len(ec.elements)-1]
+				ec.elements = ec.elements[:len(ec.elements)-1]
 				cleaned++
 			}
 		}
 		ec.Unlock()
 		if cleaned < rerunCount {
-			// "clean enough"
 			return
 		}
 	}
-	return
 }
 
-var (
-	timeNow      = time.Now
-	cleanerSleep = time.Sleep
-	cleanerDone  = func() {}
-)
+// Close closes the cache.
+func (ec *ExpireCache) Close() {
+	ec.cancel()
+}
